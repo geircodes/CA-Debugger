@@ -69,6 +69,7 @@ namespace ClarionDebugger.Terminal
             _svc.ModuleDataReceived    += OnSvcModuleData;
             _svc.ExpandedReceived      += OnSvcExpanded;
             _svc.FrameLocalsReceived   += OnSvcFrameLocals;
+            _svc.QueueRowsReceived     += OnSvcQueueRows;
             _svc.WatchReceived         += OnSvcWatch;
             _svc.VariableSet           += OnSvcVariableSet;
             _svc.BreakpointSet         += OnSvcBreakpointSet;
@@ -103,6 +104,7 @@ namespace ClarionDebugger.Terminal
             _svc.ModuleDataReceived     -= OnSvcModuleData;
             _svc.ExpandedReceived       -= OnSvcExpanded;
             _svc.FrameLocalsReceived    -= OnSvcFrameLocals;
+            _svc.QueueRowsReceived      -= OnSvcQueueRows;
             _svc.WatchReceived          -= OnSvcWatch;
             _svc.VariableSet            -= OnSvcVariableSet;
             _svc.BreakpointSet          -= OnSvcBreakpointSet;
@@ -145,6 +147,10 @@ namespace ClarionDebugger.Terminal
 
         private void OnSvcFrameLocals(string reqId, string itemsJson) => UI(() =>
             Post("{\"type\":\"framelocals\",\"reqId\":" + Str(reqId) + ",\"items\":[" + (itemsJson ?? "") + "]}"));
+
+        private void OnSvcQueueRows(string reqId, string itemsJson, int total, string error) => UI(() =>
+            Post("{\"type\":\"queuerows\",\"reqId\":" + Str(reqId) + ",\"total\":" + total
+                + ",\"error\":" + Str(error) + ",\"items\":[" + (itemsJson ?? "") + "]}"));
         private void OnSvcWatch(DebugWatch w) => UI(() => OnWatch(w));
         private void OnSvcVariableSet(string va, bool ok, string value, string error) => UI(() =>
         {
@@ -369,6 +375,15 @@ namespace ClarionDebugger.Terminal
                             var a = data.Split('|');
                             if (a.Length == 3 && int.TryParse(a[0], out int rq))
                                 _svc.RequestFrameLocals(rq, a[1], a[2]);
+                        }
+                        break;
+                    case "queuerows":   // stored rows of a live QUEUE: data = "reqId|module|typeRef|ctrl|from"
+                        if (!string.IsNullOrEmpty(data) && _svc.State == DebugSessionState.Paused)
+                        {
+                            var a = data.Split('|');
+                            if (a.Length == 5 && int.TryParse(a[0], out int rq)
+                                && uint.TryParse(a[2], out uint tr) && int.TryParse(a[4], out int from))
+                                _svc.RequestQueueRows(rq, a[1], tr, a[3], from);
                         }
                         break;
                     case "editvar": EditVar(data); break;
@@ -1042,23 +1057,72 @@ namespace ClarionDebugger.Terminal
 
         /// <summary>Pause-time jump to the current execution line. With ClarionAssistant's Monaco overlay
         /// on, the stock editor sits hidden behind Monaco, so JumpToCurrentLine moves an invisible caret and
-        /// the visible Monaco editor never scrolls. Prefer the Monaco navigator (its frozen contract covers
-        /// overlay ON and OFF and self-queues if the page isn't ready); only fall back to the stock editor's
-        /// current-line jump — which also paints the execution-line marker — when ClarionAssistant is absent.</summary>
+        /// the visible Monaco editor never scrolls. Prefer ClarionAssistant's Monaco current-line marker
+        /// (paints a gutter glyph + line tint AND reveals, in one call) — it returns false whenever it did
+        /// NOT paint anything visible (ClarionAssistant absent, overlay off for this file, or the file isn't
+        /// captured yet), in which case fall back to the stock editor's current-line jump, which also paints
+        /// the native execution-line marker.</summary>
         private static void TryJump(string path, int line)
         {
             if (string.IsNullOrEmpty(path)) return;
             try
             {
-                var nav = ResolveMonacoNavigator();
-                if (nav != null)
+                var setLine = ResolveMonacoSetDebugCurrentLine();
+                if (setLine != null)
                 {
-                    object handled = nav.Invoke(null, new object[] { path, line, 1 });
+                    object handled = setLine.Invoke(null, new object[] { path, line, 1 });
                     if (handled is bool && (bool)handled) return;
                 }
             }
             catch { }
             try { ICSharpCode.SharpDevelop.Debugging.DebuggerService.JumpToCurrentLine(path, line, 1, line, 1); }
+            catch { }
+        }
+
+        // Cached cross-addin hooks: ClarionAssistant.Services.MonacoSourceNavigator.SetDebugCurrentLine/ClearDebugCurrentLine.
+        private static MethodInfo _monacoSetDebugLine;
+        private static MethodInfo _monacoClearDebugLine;
+
+        /// <summary>Resolve ClarionAssistant's Monaco current-line-marker hooks, if that addin is loaded.
+        /// Same reflection-by-name pattern as <see cref="ResolveMonacoNavigator"/> (no compile-time reference).
+        /// Frozen contracts (with CA-Terminal-1-CC):
+        ///   bool ClarionAssistant.Services.MonacoSourceNavigator.SetDebugCurrentLine(string filePath, int line, int column)
+        ///   void ClarionAssistant.Services.MonacoSourceNavigator.ClearDebugCurrentLine()
+        /// Absent type == ClarionAssistant not loaded, or an older version predating this feature.</summary>
+        private static MethodInfo ResolveMonacoSetDebugCurrentLine()
+        {
+            ResolveMonacoDebugLineHooks();
+            return _monacoSetDebugLine;
+        }
+
+        private static MethodInfo ResolveMonacoClearDebugCurrentLine()
+        {
+            ResolveMonacoDebugLineHooks();
+            return _monacoClearDebugLine;
+        }
+
+        private static void ResolveMonacoDebugLineHooks()
+        {
+            // Same retry-until-found pattern as ResolveMonacoNavigator below (not a one-shot attempt flag):
+            // a failed first lookup can only mean ClarionAssistant's assembly hadn't finished loading yet
+            // (addin load-order race), not that it's permanently absent — so keep retrying on every call
+            // until both methods are actually found.
+            if (_monacoSetDebugLine != null && _monacoClearDebugLine != null) return;
+            try
+            {
+                foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+                {
+                    Type t;
+                    try { t = asm.GetType("ClarionAssistant.Services.MonacoSourceNavigator", false); }
+                    catch { t = null; }
+                    if (t == null) continue;
+                    _monacoSetDebugLine = t.GetMethod("SetDebugCurrentLine", BindingFlags.Public | BindingFlags.Static,
+                        null, new[] { typeof(string), typeof(int), typeof(int) }, null);
+                    _monacoClearDebugLine = t.GetMethod("ClearDebugCurrentLine", BindingFlags.Public | BindingFlags.Static,
+                        null, Type.EmptyTypes, null);
+                    break;
+                }
+            }
             catch { }
         }
 
@@ -1143,11 +1207,19 @@ namespace ClarionDebugger.Terminal
         /// <summary>
         /// Remove the editor's current-line marker (the yellow → in the gutter) that JumpToCurrentLine
         /// paints on each pause. The IDE never clears it on its own for an external engine, so the arrow
-        /// would otherwise linger in the Clarion source after the session ends.
+        /// would otherwise linger in the Clarion source after the session ends. Also clears ClarionAssistant's
+        /// Monaco-side marker (gutter glyph + line tint), if that addin is loaded and something is painted —
+        /// both calls are unconditional (TryJump may have painted either one depending on overlay state).
         /// </summary>
         private static void ClearCurrentLineMarker()
         {
             try { ICSharpCode.SharpDevelop.Debugging.DebuggerService.RemoveCurrentLineMarker(); }
+            catch { }
+            try
+            {
+                var clearLine = ResolveMonacoClearDebugCurrentLine();
+                if (clearLine != null) clearLine.Invoke(null, null);
+            }
             catch { }
         }
 

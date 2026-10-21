@@ -8,13 +8,9 @@ namespace ClarionDbg.Cli
     internal sealed partial class DebugEngine
     {
         // ------------------------------------------------------------------ locals (Variables panel)
-
-        // Clarion STRING/CSTRING content is Windows ANSI (cp1252), not 7-bit ASCII — Encoding.ASCII.GetString
-        // replaces every byte >= 0x80 with a literal '?', which silently destroys real (or garbage-tail)
-        // high-byte content and is indistinguishable from an actual '?' character in the source data. cp1252
-        // maps every byte to SOME visible glyph, so what's on screen matches what's really in memory — still
-        // not byte-exact proof for binary content (that needs a raw export), but no longer lossy for display.
-        private static readonly Encoding Cp1252 = Encoding.GetEncoding(1252);
+        //
+        // Value rendering (FormatValueAt / FormatBcd) lives in DebugEngine.ValueFormat.cs — it is shared
+        // with watch, globals, breakpoint conditions, and QUEUE rows.
 
         /// <summary>Build the JSON rows for one frame's locals — its proc's entry RVA keys the local set,
         /// each value read live at [frameEbp + frameOffset]. Direct GROUP locals expand inline to nested member
@@ -47,10 +43,25 @@ namespace ClarionDbg.Cli
 						&& l.TypeCode == 0x16)
 						continue;
 					uint slotVa = (uint)((long)frameEbp + l.FrameOff);
+					// Queue discovery has to happen HERE, while the frame pointer is in hand: locating a
+					// local queue's control block means signature-scanning its frame. The node then carries
+					// ctrl + the live count, so the row-fetch command needs no frame of its own.
+					var qi = TryDiscoverQueueLocal(l, slotVa, frameEbp, locals);
 					rows.Add(NodeJson(l.Name, l.Type, l.TypeCode, l.Target, l.Size, l.Places,
-									  slotVa, l.FrameOff, m.Name));
+									  slotVa, l.FrameOff, m.Name, qi));
 				}
 			return rows;
+		}
+
+		/// <summary>Is this local a live QUEUE? Returns its located control block + row count, or null for
+		/// any local that is not a queue (which is most of them — a plain &amp;GROUP has no control block).</summary>
+		private QueueInfo TryDiscoverQueueLocal(LocalSym l, uint slotVa, uint frameEbp, List<LocalSym> locals)
+		{
+			if (l == null || l.Type == null) return null;
+			int hops;
+			var g = l.Type.ResolveGroup(out hops);
+			if (g == null || g.Size == 0) return null;
+			return DiscoverQueueForSlot(slotVa, l.TypeCode, hops, g.Size, frameEbp, locals);
 		}
 
 
@@ -170,14 +181,23 @@ namespace ClarionDbg.Cli
             return false;
         }
 
-        /// <summary>The GROUP/QUEUE layout a type describes — directly (a group) or through one reference hop
-        /// (a by-ref group/queue/class). Returns null for non-aggregates.</summary>
+        /// <summary>The GROUP/QUEUE layout a type describes — directly (a group) or through any number of
+        /// reference hops. Returns null for non-aggregates. See <see cref="ClarionType.ResolveGroup"/>: a
+        /// `&amp;QUEUE` local is reference-&gt;reference-&gt;group, so stopping at one hop (as this used to)
+        /// left reference queues with no members at all.</summary>
         private static ClarionType GroupTypeOf(ClarionType t)
         {
-            if (t == null) return null;
-            if (t.Kind == TypeKind.Group) return t;
-            if (t.Kind == TypeKind.Reference && t.Referent != null && t.Referent.Kind == TypeKind.Group) return t.Referent;
-            return null;
+            int hops;
+            return GroupTypeOf(t, out hops);
+        }
+
+        /// <summary>As <see cref="GroupTypeOf(ClarionType)"/>, but also reports how many pointer
+        /// dereferences reach the aggregate — 1 for `QUEUE(T)` (slot -&gt; record image), 2 for `&amp;T`
+        /// (slot -&gt; control block -&gt; record image).</summary>
+        private static ClarionType GroupTypeOf(ClarionType t, out int hops)
+        {
+            hops = 0;
+            return t == null ? null : t.ResolveGroup(out hops);
         }
 
         /// <summary>The single composite value renderer. Three shapes:
@@ -185,12 +205,15 @@ namespace ClarionDbg.Cli
         ///  • a REFERENCE to a group/queue/class -> a LAZY node ("ref":true + addr/module/typeRef) the host
         ///    expands on demand via the `expand` command (avoids chasing deep/cyclic ABC object graphs);
         ///  • everything else -> a leaf through the shared FormatValueAt/ClarionTypeLabel.
-        /// <paramref name="module"/> is the owning image's name, echoed on ref rows for re-resolution.</summary>
-        private string NodeJson(string name, ClarionType type, byte code, byte target, uint size, int places, uint va, int? frameOff, string module)
+        /// <paramref name="module"/> is the owning image's name, echoed on ref rows for re-resolution.
+        /// <paramref name="queue"/>, when non-null, marks this node as a live QUEUE and carries its control
+        /// block + row count so the host can offer a RECORDS child that fetches rows on demand.</summary>
+        private string NodeJson(string name, ClarionType type, byte code, byte target, uint size, int places, uint va, int? frameOff, string module, QueueInfo queue = null)
         {
             var sb = new StringBuilder();
             sb.Append("{\"name\":").Append(Json.Str(name));
-            ClarionType g = GroupTypeOf(type);
+            int refHops;
+            ClarionType g = GroupTypeOf(type, out refHops);
 
             // A slot is by-reference if its symbol code says so (0x16) OR its type record resolved to a
             // Reference. Key the deref decision on EITHER, not on Kind alone: a code-0x16 local whose typeRef
@@ -205,7 +228,22 @@ namespace ClarionDbg.Cli
                 // (ref:true + addr/module/typeRef), so expanding it goes straight to the members. No nested
                 // "RECORD" hop in between: that was an extra, unnecessary click to get from the variable to
                 // its own content. Still avoids blindly chasing pointers — expansion only happens on click.
-                uint ptr = ReadU32(va);
+                // Follow ONE deref per reference hop. A `QUEUE(T)` slot holds the record image (1 hop), but a
+                // `&T` slot holds the QUEUE CONTROL BLOCK (2 hops) whose +0x00 is the record image — expanding
+                // after a single deref there would render the 16-byte control header as the first members.
+                // A code-0x16 slot whose typeRef points straight at a GROUP reports 0 hops yet is still a
+                // pointer, so never deref fewer than once.
+                int derefs = refHops < 1 ? 1 : refHops;
+                uint ptr = va;
+                for (int i = 0; i < derefs && ptr != 0; i++) ptr = ReadU32(ptr);
+                // A QUEUE PARAMETER breaks the "reference depth == pointer depth" rule: it arrives as a
+                // pointer to the CALLER's 16-byte control block, yet TSWD still reports it as a single hop
+                // (reference -> group). So the loop above lands on the control block, not the record image —
+                // which would render the control header's four dwords as the record's first members AND, since
+                // the leaf path emits edit metadata, offer an edit pencil that writes over the live queue's
+                // control block. Queue discovery already resolved the real record image, so use it.
+                if (queue != null && ptr != 0 && ptr == queue.Ctrl && queue.RecordImage != 0)
+                    ptr = queue.RecordImage;
                 sb.Append(",\"type\":\"\"");
                 if (ptr == 0)
                     sb.Append(",\"value\":").Append(Json.Str("(null)"));
@@ -244,6 +282,14 @@ namespace ClarionDbg.Cli
                       .Append(",\"places\":").Append(places);
             }
             if (frameOff.HasValue) sb.Append(",\"frameOff\":").Append(frameOff.Value);
+            // A live QUEUE advertises its rows here. The node keeps its normal record-buffer expansion — the
+            // record image is what the program itself is looking at — and the host adds a RECORDS child that
+            // pulls stored rows via `queuerows`. Emitted even when records is 0, so an empty queue still reads
+            // as a queue rather than as a plain group.
+            if (queue != null && g != null)
+                sb.Append(",\"queueCtrl\":\"0x").Append(queue.Ctrl.ToString("X")).Append('"')
+                  .Append(",\"records\":").Append(queue.Count)
+                  .Append(",\"queueTypeRef\":").Append(g.TypeRef);
             sb.Append('}');
             return sb.ToString();
         }
@@ -433,13 +479,33 @@ namespace ClarionDbg.Cli
             t.RenderHint(out code, out size, out places);
         }
 
+        /// <summary>One THREADed data symbol waiting on its own func-eval before <c>moduledata</c> can render
+        /// it — its TSWD address is only a link-time TEMPLATE, and the live value lives at a per-thread
+        /// instance THR$GetInstance resolves, exactly as <c>watch</c> resolves it.</summary>
+        private struct PendingModuleSym { public LoadedModule Owner; public DataSymbol Ds; }
+
+        // moduledata may need SEVERAL func-evals in a row — THR$GetInstance resolves one template at a
+        // time — so the accumulation lives on the engine while the chain runs, then a single moduledata
+        // event is emitted. No reqId to correlate: the host just replaces the whole panel each time
+        // (buildModuleData), so this doesn't need queuerows's leak-proofing.
+        private List<string> _mdRows;
+        private string _mdModule;
+        private Queue<PendingModuleSym> _mdPending;
+
         /// <summary>EXPERIMENT: moduledata — list the CURRENT module's module-scope data (the data declared
         /// in this module's DATA section), read live. Excludes file record buffers (*:RECORD) which already
-        /// show in the file-buffer tree. Emits a `moduledata` event for the host's Variables panel.</summary>
-        private void HandleModuleDataCommand(string[] parts, ref Native.CONTEXT_X86 ctx, bool haveCtx)
+        /// show in the file-buffer tree. THREADed symbols are resolved to their per-thread instance via
+        /// func-eval before rendering — reading at the template address would show the wrong thread's copy
+        /// (or an unfixed-up template) and, for an editable field, would WRITE to the template on edit.
+        ///
+        /// Returns true when a func-eval was armed for the first pending THREADed symbol, meaning the caller
+        /// must leave the pause loop exactly as `watch` does; false means the event was already emitted (no
+        /// THREADed symbols, or none could be resolved) and the caller should stay paused.</summary>
+        private bool HandleModuleDataCommand(string[] parts, uint tid, ref Native.CONTEXT_X86 ctx, bool haveCtx)
         {
-            var rows = new List<string>();
-            string module = null;
+            _mdRows = new List<string>();
+            _mdModule = null;
+            _mdPending = new Queue<PendingModuleSym>();
 
             if (haveCtx)
             {
@@ -448,25 +514,87 @@ namespace ClarionDbg.Cli
                 if (m != null && m.Dbg != null && m.Dbg.ResolveSymbolVerified(ctx.Eip - m.LoadBase, out sym))
                 {
                     int mi = sym.ModuleIdx;
-                    module = m.Dbg.ModuleNameForIdx(mi);
+                    _mdModule = m.Dbg.ModuleNameForIdx(mi);
                     var syms = m.Dbg.DataSymbols;
                     foreach (var ds in syms ?? new List<DataSymbol>())
                     {
                         if (ds.ModuleIdx != mi) continue;
                         if (ds.Name != null && ds.Name.EndsWith(":RECORD", StringComparison.OrdinalIgnoreCase))
                             continue;   // file record buffer — belongs to the file-buffer tree, not module data
+                        bool threaded = m.CwtlsHi != 0 && ds.Rva >= m.CwtlsLo && ds.Rva < m.CwtlsHi;
+                        if (threaded) { _mdPending.Enqueue(new PendingModuleSym { Owner = m, Ds = ds }); continue; }
                         uint va = m.LoadBase + ds.Rva;
                         ClarionType gt = ds.Type != null && ds.Type.Kind == TypeKind.Group ? ds.Type : null;
-                        rows.Add(NodeJson(ds.Name, gt, ds.TypeCode, 0, ds.Size, 0, va, null, m.Name));
+                        _mdRows.Add(NodeJson(ds.Name, gt, ds.TypeCode, 0, ds.Size, 0, va, null, m.Name));
                     }
                 }
             }
 
+            if (!haveCtx)
+            {
+                // No context to hijack from — render every pending THREADed symbol at its template address
+                // rather than dropping it silently.
+                while (_mdPending.Count > 0)
+                {
+                    var p = _mdPending.Dequeue();
+                    uint va = p.Owner.LoadBase + p.Ds.Rva;
+                    ClarionType gt = p.Ds.Type != null && p.Ds.Type.Kind == TypeKind.Group ? p.Ds.Type : null;
+                    _mdRows.Add(NodeJson(p.Ds.Name, gt, p.Ds.TypeCode, 0, p.Ds.Size, 0, va, null, p.Owner.Name));
+                }
+                EmitModuleData();
+                return false;
+            }
+
+            return DrainModuleDataPending(tid, ref ctx);
+        }
+
+        /// <summary>Resolve ONE pending THREADed module-data symbol via func-eval, or emit once none remain.
+        ///
+        /// Deliberately opens its OWN thread handle per call rather than threading one through from the
+        /// caller: the continuation below runs from inside <see cref="OnEvalComplete"/>, a LATER, separate
+        /// call — any handle captured from an earlier frame could be stale by then. <paramref name="ctx"/>
+        /// is likewise only valid for the FIRST call (the real PausedWait frame); the chained calls pass
+        /// <c>ref _evalSavedCtx</c>, which <see cref="BeginThreadedEval"/> guarantees is the genuine paused
+        /// context at the moment each continuation runs.</summary>
+        private bool DrainModuleDataPending(uint tid, ref Native.CONTEXT_X86 ctx)
+        {
+            if (_mdPending.Count == 0) { EmitModuleData(); return false; }
+
+            var p = _mdPending.Dequeue();
+            var owner = p.Owner; var ds = p.Ds;
+            uint templateVa = owner.LoadBase + ds.Rva;
+            ClarionType gt = ds.Type != null && ds.Type.Kind == TypeKind.Group ? ds.Type : null;
+
+            IntPtr hThread = OpenThreadForContext(tid);
+            bool armed = hThread != IntPtr.Zero && BeginThreadedEval(owner, templateVa, tid, hThread, ref ctx, true,
+                "moduledata " + ds.Name,
+                instanceVa =>
+                {
+                    uint va = instanceVa != 0 ? instanceVa : templateVa;
+                    _mdRows.Add(NodeJson(ds.Name, gt, ds.TypeCode, 0, ds.Size, 0, va, null, owner.Name));
+                    if (instanceVa != 0)
+                        DrainModuleDataPending(tid, ref _evalSavedCtx);   // next pending symbol, if any
+                    else
+                        EmitModuleData();   // resolution failed/aborted — show what we have and stop chaining
+                });
+            if (hThread != IntPtr.Zero) Native.CloseHandle(hThread);
+
+            if (armed) return true;
+
+            // Could not arm an eval for this symbol (no THR$GetInstance import, or one already in flight —
+            // BeginThreadedEval already reported why). Fall back to the template address and keep going
+            // rather than dropping the symbol from the panel.
+            _mdRows.Add(NodeJson(ds.Name, gt, ds.TypeCode, 0, ds.Size, 0, templateVa, null, owner.Name));
+            return DrainModuleDataPending(tid, ref ctx);
+        }
+
+        private void EmitModuleData()
+        {
             if (EmitJson)
-                Console.WriteLine("@JSON {\"event\":\"moduledata\",\"module\":" + Json.Str(module)
-                    + ",\"items\":[" + string.Join(",", rows) + "]}");
+                Console.WriteLine("@JSON {\"event\":\"moduledata\",\"module\":" + Json.Str(_mdModule)
+                    + ",\"items\":[" + string.Join(",", _mdRows) + "]}");
             else
-                Console.WriteLine($"  module data ({rows.Count}) in {module ?? "(unknown)"}");
+                Console.WriteLine($"  module data ({_mdRows.Count}) in {_mdModule ?? "(unknown)"}");
         }
 
         /// <summary>The single Clarion type-label authority (e.g. LONG, STRING(20), DECIMAL(7,2)). Shared by
@@ -501,118 +629,5 @@ namespace ClarionDbg.Cli
         // a Clarion packed-decimal of N bytes carries 2N-1 significant digits (the remaining nibble is the sign)
         private static int DecimalDigits(uint sizeBytes) { return sizeBytes > 0 ? (int)(sizeBytes * 2 - 1) : 0; }
 
-        /// <summary>The single Clarion value-rendering authority: read and format a typed value live from
-        /// <paramref name="va"/> on the paused thread. Shared by the Locals panel and watch/globals (and, in
-        /// future, module data) so every scope renders a value identically. References (&amp;STRING) are
-        /// dereferenced here — which is why this lives engine-side: only the engine can read target memory.</summary>
-        internal string FormatValueAt(byte code, byte target, uint size, int places, uint va)
-        {
-            int len;
-            switch (code)
-            {
-                case 0x18: len = (int)Math.Min(size == 0 ? 1u : size, 1024u); break;
-                case 0x23: case 0x24: len = (int)(size == 0 ? 1u : size); break;
-                case 0x11: case 0x12: case 0x13: case 0x25: len = (int)(size == 0 ? 4u : size); break;
-                case 0x16: len = 4; break;
-                default:   len = size > 0 ? (int)Math.Min(size, 64u) : 4; break;
-            }
-            var buf = new byte[len];
-            int got = ReadBlock(va, buf);
-            if (got <= 0) return "<unreadable>";
-
-            switch (code)
-            {
-                case 0x11:   // signed
-                    if (size == 1) return ((sbyte)buf[0]).ToString();
-                    if (size == 2) return BitConverter.ToInt16(buf, 0).ToString();
-                    return BitConverter.ToInt32(buf, 0).ToString();
-                case 0x12:   // unsigned
-                    if (size == 1) return buf[0].ToString();
-                    if (size == 2) return BitConverter.ToUInt16(buf, 0).ToString();
-                    return BitConverter.ToUInt32(buf, 0).ToString();
-                case 0x13: case 0x25:   // float (SREAL / REAL)
-                    return size == 8 ? BitConverter.ToDouble(buf, 0).ToString("R")
-                                     : BitConverter.ToSingle(buf, 0).ToString("R");
-                case 0x18:   // STRING/CSTRING/PSTRING — show the text (cut at NUL, else trim trailing spaces)
-                {
-                    int n = Array.IndexOf(buf, (byte)0, 0, got);
-                    if (n < 0) n = got;
-                    return "'" + Cp1252.GetString(buf, 0, n).TrimEnd(' ') + "'";
-                }
-                case 0x23: return FormatBcd(buf, got, places, packed: false);  // DECIMAL (sign-first)
-                case 0x24: return FormatBcd(buf, got, places, packed: true);   // PDECIMAL (sign-last)
-                case 0x16:   // reference: the stack slot holds a pointer
-                {
-                    uint ptr = BitConverter.ToUInt32(buf, 0);
-                    if (ptr == 0) return "(null)";
-                    if (target == 0x18)   // &STRING — deref and show a bounded preview (space-padded)
-                    {
-                        // A dynamically-allocated &STRING has no reliable length signal: whatever "size"
-                        // we were given (StringTheory's own _DATAEND data-length property, or a best-effort
-                        // peek at Clarion's native NEW(STRING) buffer-size trailer for a plain &STRING) is at
-                        // best the ALLOCATED capacity, not necessarily the true content length — and there
-                        // is no NUL/length marker inside a Clarion STRING to fall back on either. So always
-                        // cap the on-screen preview at a small, fixed size regardless of source — garbage
-                        // tail included is fine here; byte-exact inspection of the full buffer belongs in a
-                        // raw memory/export view, not this text preview. The type label upstream (which
-                        // still uses the untruncated `size`) tells the user there may be more to see.
-                        const int previewCap = 32;
-                        int sn = size > 0 ? (int)Math.Min(size, previewCap) : previewCap;
-                        var sbuf = new byte[sn];
-                        int sg = ReadBlock(ptr, sbuf);
-                        if (sg <= 0) return "&0x" + ptr.ToString("X") + " <unreadable>";
-                        int nz = Array.IndexOf(sbuf, (byte)0, 0, sg);   // CSTRING terminator, if any
-                        if (nz < 0) nz = sg;
-                        return "'" + Cp1252.GetString(sbuf, 0, nz).TrimEnd(' ') + "'";
-                    }
-                    return "&0x" + ptr.ToString("X");
-                }
-                case 0x08:   // GROUP / CLASS instance — a composite, not a scalar; members not yet expanded
-                    return "{…}";
-                default:
-                {
-                    var sb = new StringBuilder("0x");
-                    for (int i = 0; i < got; i++) sb.Append(buf[i].ToString("X2"));
-                    return sb.ToString();
-                }
-            }
-        }
-
-        /// <summary>Decode a Clarion packed-BCD decimal. Two layouts (verified in clarion-pdb):
-        /// DECIMAL (sign-first): sign = high nibble of byte 0 (non-zero = negative); digits = byte0.low,
-        /// then byte_i.high, byte_i.low (MSB first). PDECIMAL (sign-last/IBM): sign = low nibble of the last
-        /// byte (0x0D = negative); digits = byte_i.high, byte_i.low up to the last byte's high nibble.</summary>
-        private static string FormatBcd(byte[] b, int size, int places, bool packed)
-        {
-            var digits = new StringBuilder();
-            bool neg;
-            if (!packed)
-            {
-                neg = (b[0] >> 4) != 0;
-                digits.Append((b[0] & 0xf).ToString());
-                for (int i = 1; i < size; i++) { digits.Append(((b[i] >> 4) & 0xf)); digits.Append((b[i] & 0xf)); }
-            }
-            else
-            {
-                neg = (b[size - 1] & 0xf) == 0xd;
-                for (int i = 0; i < size - 1; i++) { digits.Append(((b[i] >> 4) & 0xf)); digits.Append((b[i] & 0xf)); }
-                digits.Append(((b[size - 1] >> 4) & 0xf));
-            }
-
-            string ds = digits.ToString();
-            string intPart, fracPart = "";
-            if (places > 0)
-            {
-                if (ds.Length <= places) ds = ds.PadLeft(places + 1, '0');
-                intPart = ds.Substring(0, ds.Length - places);
-                fracPart = ds.Substring(ds.Length - places);
-            }
-            else intPart = ds;
-
-            intPart = intPart.TrimStart('0');
-            if (intPart.Length == 0) intPart = "0";
-            string val = places > 0 ? intPart + "." + fracPart : intPart;
-            return (neg && val != "0") ? "-" + val : val;
-        }
     }
 }

@@ -165,6 +165,31 @@ namespace ClarionDbg.Core
                 default:                code = 0x00; break;                 // array / unknown — composite
             }
         }
+
+        /// <summary>The GROUP/QUEUE layout this type describes — directly, or through ANY number of
+        /// reference hops. <paramref name="hops"/> is how many hops were followed, which is exactly how many
+        /// pointer dereferences the caller must perform to reach the aggregate's bytes:
+        /// <list type="bullet">
+        /// <item>a direct <c>GROUP</c>/<c>QUEUE</c> instance -> 0 hops (read inline at the slot);</item>
+        /// <item><c>MyQ QUEUE(MyQType)</c> -> 1 hop (slot holds the record-image pointer);</item>
+        /// <item><c>MyRefQ &amp;MyQType</c> -> 2 hops (slot holds the QUEUE control block, whose +0x00 is
+        /// the record image) — this is why a single deref is not enough for a reference queue.</item>
+        /// </list>
+        /// Returns null for non-aggregates. The guard bounds cyclic/deep graphs (ABC objects reference each
+        /// other), so a malformed or self-referential chain returns null instead of spinning.</summary>
+        public ClarionType ResolveGroup(out int hops)
+        {
+            hops = 0;
+            ClarionType t = this;
+            for (int guard = 0; t != null && guard < 8; guard++)
+            {
+                if (t.Kind == TypeKind.Group) return t;
+                if (t.Kind != TypeKind.Reference || t.Referent == null) return null;
+                t = t.Referent;
+                hops++;
+            }
+            return null;
+        }
     }
 
     /// <summary>

@@ -893,7 +893,15 @@
     const path = (parentPath||'')+'>'+(v.name||'');
     const eager = v.children || null;            // DIRECT group: members already supplied
     const isRef = !!v.ref;                        // REFERENCE: expand lazily (deref on the engine)
-    const expandable = (eager && eager.length) || isRef;
+    // A live QUEUE: the engine located its control block while it had the frame pointer, so this row can
+    // fetch STORED ROWS on demand. `queueRows` marks the synthetic RECORDS(n) child that does the fetching.
+    // `!v.queueRows` is load-bearing, not decorative: recordsChild() copies queueCtrl onto that synthetic
+    // node too (so requestQueueRows can read it back off `v`), which would otherwise make the RECORDS node
+    // satisfy isQueue itself — grafting a RECORDS child onto RECORDS, forever, INFINITELY, since the eager
+    // graft below runs unconditionally at render time rather than behind an open/click gate.
+    const isQueue = !v.queueRows && v.queueCtrl !== undefined && v.queueCtrl !== null;
+    const isQueueRows = !!v.queueRows;
+    const expandable = (eager && eager.length) || isRef || isQueueRows || isQueue;
     const row=document.createElement('div'); row.className='row';
     row.style.paddingLeft=(14+depth*16)+'px';
     const isNum=/^-?[0-9]/.test(v.value||'');
@@ -927,7 +935,10 @@
     function renderKids(items){ const b=ensureBox(); b.innerHTML='';
       sortVars(items).forEach(c=>renderVarRow(b, c, depth+1, path));
       if(!items || !items.length) b.innerHTML='<div class="row" style="padding-left:'+(14+(depth+1)*16)+'px;opacity:.55">(no members)</div>'; }
-    if(eager && eager.length){ renderKids(eager); loaded=true; }
+    // A DIRECT (non-reference) queue local renders its record buffer eagerly, so its RECORDS child has to
+    // be grafted on here rather than in the lazy-expand callback below.
+    if(eager && eager.length){ renderKids(recordsChild(v, eager)); loaded=true; }
+    else if(isQueue && !isRef){ renderKids(recordsChild(v, [])); loaded=true; }
 
     function toggle(){
       open=!open; row.querySelector('.ar').textContent=open?'▾':'▸';
@@ -935,7 +946,22 @@
       if(open && isRef && !loaded){
         loaded=true; const b=ensureBox();
         b.innerHTML='<div class="row" style="padding-left:'+(14+(depth+1)*16)+'px;opacity:.55">…</div>';
-        requestExpand(v, items=>{ renderKids(items); if(box) box.style.display=open?'':'none'; });
+        // A queue keeps its normal expansion — the record buffer, i.e. the row the PROGRAM is currently
+        // looking at — and gains a RECORDS child holding the rows actually stored in the queue.
+        requestExpand(v, items=>{ renderKids(recordsChild(v, items)); if(box) box.style.display=open?'':'none'; });
+      }
+      if(open && isQueueRows && !loaded){
+        loaded=true; const b=ensureBox();
+        b.innerHTML='<div class="row" style="padding-left:'+(14+(depth+1)*16)+'px;opacity:.55">reading rows…</div>';
+        requestQueueRows(v, (items,total,error)=>{
+          if(error){ b.innerHTML='<div class="row" style="padding-left:'+(14+(depth+1)*16)+'px;opacity:.55">'+esc(error)+'</div>'; }
+          else {
+            // The engine windows each reply, so say so rather than silently showing a prefix.
+            if(total>items.length) items=items.concat([{name:'…',type:'',value:(total-items.length)+' more row(s) not shown'}]);
+            renderKids(items);
+          }
+          if(box) box.style.display=open?'':'none';
+        });
       }
       if(box) box.style.display=open?'':'none';
     }
@@ -952,6 +978,26 @@
     if(!v.module || v.typeRef===undefined || !v.addr){ cb([]); return; }
     const id=++_expandSeq; _expandCbs[id]=cb;
     send('expand', id+'|'+v.module+'|'+v.typeRef+'|'+v.addr);
+  }
+
+  // ---- QUEUE rows: append a synthetic RECORDS(n) child to a queue node's expansion ----
+  // Sits alongside the record-buffer members rather than replacing them: the record buffer is what the
+  // program itself sees, the rows are what the queue is holding, and both are worth having.
+  function recordsChild(v, items){
+    if(v.queueCtrl===undefined || v.queueCtrl===null) return items;
+    return (items||[]).concat([{
+      name:'RECORDS ('+(v.records||0)+')', type:'', value:'',
+      queueRows:true, module:v.module, queueCtrl:v.queueCtrl,
+      queueTypeRef:v.queueTypeRef, records:v.records||0
+    }]);
+  }
+
+  let _qrSeq=0; const _qrCbs={};
+  function requestQueueRows(v, cb){
+    if(!v.module || v.queueTypeRef===undefined || !v.queueCtrl){ cb([],0,'queue node is missing its control block'); return; }
+    if((v.records||0)===0){ cb([],0,null); return; }   // empty queue — no round trip needed
+    const id=++_qrSeq; _qrCbs[id]=cb;
+    send('queuerows', id+'|'+v.module+'|'+v.queueTypeRef+'|'+v.queueCtrl+'|0');
   }
 
   // ---- per-frame locals (Call-Stack-driven Variables): a frame's locals load lazily on expand ----
@@ -1307,6 +1353,7 @@
       case 'framelocals': { const cb=_flCbs[m.reqId]; if(cb){ delete _flCbs[m.reqId]; cb(m.items||[]); } break; }
       case 'moduledata': buildModuleData(m.module, m.items||[]); break;
       case 'expanded': { const cb=_expandCbs[m.reqId]; if(cb){ delete _expandCbs[m.reqId]; cb(m.items||[]); } break; }
+      case 'queuerows': { const cb=_qrCbs[m.reqId]; if(cb){ delete _qrCbs[m.reqId]; cb(m.items||[], m.total||0, m.error||null); } break; }
       case 'watch': applyValue(m.name, m.found, m.value, m.typeName, m.threaded, {va:m.va, typeCode:m.typeCode, size:m.size, places:m.places, outOfScope:m.outOfScope}); break;
       case 'varset': onVarSet(m); break;
       case 'bplist': buildBps(m.bps||[]); break;

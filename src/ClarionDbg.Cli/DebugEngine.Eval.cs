@@ -52,27 +52,64 @@ namespace ClarionDbg.Cli
                 return false;
             }
 
+            // The continuation runs once THR$GetInstance reports this thread's instance address.
+            uint capturedSize = loc.Size;
+            byte capturedCode = loc.TypeCode;
+            return BeginThreadedEval(owner, templateVa, tid, hThread, ref ctx, haveCtx, "watch " + name,
+                instanceVa =>
+                {
+                    // instanceVa == 0 means resolution failed; report a miss rather than reading address 0.
+                    if (instanceVa == 0)
+                    {
+                        if (EmitJson) Console.WriteLine("@JSON " + Json.WatchMiss(name, false));
+                        Console.WriteLine($"  watch {name}: threaded instance could not be resolved");
+                        return;
+                    }
+                    EmitWatchValue(name, templateVa, instanceVa, true, capturedCode, capturedSize);
+                });
+        }
+
+        /// <summary>Hijack the paused thread to call <c>ClaRUN!THR$GetInstance(EAX=templateVa, EBX=.cwtls
+        /// base)</c> and trap its return at <see cref="EVAL_TRAP_VA"/>, so <paramref name="done"/> receives
+        /// the per-thread instance address. Returns true when the eval was armed, meaning the caller MUST
+        /// leave the pause loop so the target can run the call; false means nothing was armed (the reason has
+        /// already been reported) and the caller should stay paused.
+        ///
+        /// This is the ONLY place an eval is armed, so every guard lives here.</summary>
+        private bool BeginThreadedEval(LoadedModule owner, uint templateVa, uint tid, IntPtr hThread,
+                                       ref Native.CONTEXT_X86 ctx, bool haveCtx, string what, Action<uint> done)
+        {
+            // ONE eval at a time. ContinueDebugEvent resumes the WHOLE process, so during the eval window
+            // another thread can hit a breakpoint, enter PausedWait, and arm a second eval — which would
+            // overwrite _evalSavedCtx/_evalTid and, worse, silently destroy a pending breakpoint re-plant:
+            // the second arming's _rearm.TryGetValue finds nothing (the first already removed the entry), so
+            // _evalHadRearm goes false and the restore below never happens. The 0xCC is then never re-planted
+            // while _armed[va] still claims it is, and the user's breakpoint stops firing for the rest of the
+            // session while the UI still shows it set. Refusing the second eval is far better.
+            if (_evalActive)
+            {
+                EmitError(what + ": a threaded-data eval is already in flight (thread " + _evalTid + ")");
+                return false;
+            }
             if (owner.ThrGetInstanceIatRva == 0)
             {
-                EmitError($"watch {name}: THREADed data but THR$GetInstance import not found in {owner.Name}");
+                EmitError($"{what}: THREADed data but THR$GetInstance import not found in {owner.Name}");
                 return false;
             }
             if (!haveCtx)
             {
-                EmitError($"watch {name}: no thread context for func-eval");
+                EmitError($"{what}: no thread context for func-eval");
                 return false;
             }
             uint helper = ReadU32(owner.LoadBase + owner.ThrGetInstanceIatRva);
             if (helper == 0)
             {
-                EmitError($"watch {name}: could not read THR$GetInstance address from the IAT");
+                EmitError($"{what}: could not read THR$GetInstance address from the IAT");
                 return false;
             }
 
-            // stash what the completion handler needs to finish the read
-            _evalName = name; _evalSize = loc.Size; _evalTypeCode = loc.TypeCode;
-            _evalTypeName = TswdDebugInfo.TypeCodeName(loc.TypeCode);
-            _evalTemplateVa = templateVa;
+            _evalDone = done;
+            _evalWhat = what;
 
             // save the real context (deep copy — the struct holds array references)
             _evalSavedCtx = CloneContext(ref ctx);
@@ -98,7 +135,7 @@ namespace ClarionDbg.Cli
         }
 
         /// <summary>The func-eval returned (AV at the magic address): collect EAX = instance VA,
-        /// restore the saved thread state, emit the watch value, and re-enter the pause loop.</summary>
+        /// restore the saved thread state, run the pending continuation, and re-enter the pause loop.</summary>
         private uint OnEvalComplete(uint tid)
         {
             _evalActive = false;
@@ -111,15 +148,71 @@ namespace ClarionDbg.Cli
             if (hThread != IntPtr.Zero) Native.SetThreadContext(hThread, ref _evalSavedCtx);
             if (_evalHadRearm) { _rearm[tid] = _evalSavedRearm; _evalHadRearm = false; }
 
-            if (instanceVa != 0)
-                EmitWatchValue(_evalName, _evalTemplateVa, instanceVa, true, _evalTypeCode, _evalSize);
-            else
-                EmitError($"watch {_evalName}: THR$GetInstance eval failed");
+            var done = _evalDone;
+            string what = _evalWhat;
+            _evalDone = null;
+            // CONTRACT: the continuation is ALWAYS invoked, with 0 meaning "resolution failed". Skipping it on
+            // failure would leave a reqId-correlated consumer (queuerows) with a request the host waits on
+            // forever — its callback map has no timeout.
+            if (instanceVa == 0) EmitError((what ?? "eval") + ": THR$GetInstance eval failed");
+            if (done != null) done(instanceVa);
+            else EmitError((what ?? "eval") + ": eval completed with no pending continuation");
 
-            // we are logically still paused at the original location — resume the command loop
-            PausedWait(tid, hThread, ref _evalSavedCtx, true, "watch");
+            // A continuation MAY have chained straight into ANOTHER eval — moduledata resolves several
+            // THREADed symbols in sequence, one eval per symbol, via DrainModuleDataPending calling itself
+            // from inside `done`. If it did, _evalActive is true again and the newly-armed hijack must
+            // actually RUN before anything else happens: skip the nested pause loop entirely and let Run()
+            // continue the process, exactly as it did for eval #1. The NEXT trapped exception re-enters
+            // this method for eval #2.
+            if (_evalActive)
+            {
+                if (hThread != IntPtr.Zero) Native.CloseHandle(hThread);
+                return Native.DBG_CONTINUE;
+            }
+
+            // We are logically still paused at the original location — resume the command loop.
+            //
+            // The reason string MUST stay "watch" regardless of which consumer armed the eval: the host
+            // suppresses this transient pause by matching that literal string (ClarionDebuggerWebView.OnPaused
+            // and ClarionDebuggerService). Any other value makes the host treat an eval round trip as a real
+            // stop — the editor jumps and steals focus, panes refresh, run-to-cursor one-shots are torn down,
+            // and every watched name is re-issued, some of them threaded, launching more evals from inside
+            // this completion path.
+            //
+            // Copy the context to a local first: passing `ref _evalSavedCtx` would alias the field to
+            // PausedWait's `ref ctx` parameter, so anything the nested loop assigned to ctx would write
+            // straight back into the field we rely on for the restore above.
+            var resumeCtx = CloneContext(ref _evalSavedCtx);
+            PausedWait(tid, hThread, ref resumeCtx, true, "watch");
             if (hThread != IntPtr.Zero) Native.CloseHandle(hThread);
             return Native.DBG_CONTINUE;
+        }
+
+        /// <summary>Undo a hijack that will never complete, so the engine does not sit with
+        /// <c>_evalActive</c> stuck true and the target thread stranded inside THR$GetInstance.
+        ///
+        /// Needed because the completion path is the ONLY place that clears <c>_evalActive</c>, yet several
+        /// things can prevent it being reached: THR$GetInstance faulting at some other address (a bad template
+        /// VA or .cwtls base), the hijacked thread being blocked in a kernel wait so SetThreadContext never
+        /// takes effect (reachable — PickPauseThread can select a GUI thread sitting in GetMessage), or the
+        /// thread exiting. Restoring is safe even if the call never ran: the hijack is pure SetThreadContext.</summary>
+        private void AbortEval(uint tid, string why)
+        {
+            if (!_evalActive || tid != _evalTid) return;
+            _evalActive = false;
+            IntPtr hThread = OpenThreadForContext(tid);
+            if (hThread != IntPtr.Zero)
+            {
+                Native.SetThreadContext(hThread, ref _evalSavedCtx);
+                Native.CloseHandle(hThread);
+            }
+            if (_evalHadRearm) { _rearm[tid] = _evalSavedRearm; _evalHadRearm = false; }
+            var done = _evalDone;
+            _evalDone = null;
+            // Report through the consumer where possible: a queuerows caller has a pending reqId the host is
+            // waiting on, and a bare EmitError would leave that row spinning forever.
+            EmitError((_evalWhat ?? "eval") + " aborted: " + why);
+            if (done != null) done(0);
         }
 
         /// <summary>Read and report a watch value (instanceVa = templateVa for non-threaded data). <paramref

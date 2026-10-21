@@ -173,6 +173,11 @@ namespace ClarionDebugger.Services
         public event Action<string, string> ModuleDataReceived; // current module's module-scope data (module, raw items JSON)
         public event Action<string, string> ExpandedReceived;   // lazy reference expansion (reqId, raw items JSON)
         public event Action<string, string> FrameLocalsReceived; // one call-stack frame's locals (reqId, raw items JSON)
+        /// <summary>Stored rows of a live QUEUE: reqId, raw items JSON, the queue's TRUE record count, and an
+        /// error (null on success). `total` can exceed the rows in this reply — the engine windows each one.
+        /// Always fires, error or not: the host resolves a pending callback by reqId and has no timeout, so a
+        /// silent drop would leave the requesting row spinning forever.</summary>
+        public event Action<string, string, int, string> QueueRowsReceived;
         public event Action<string, List<DebugDisasmInstr>> DisasmReceived; // EXPERIMENT: disassembly listing (tag, instrs)
         public event Action<DebugWatch> WatchReceived;             // watch-by-name value
         public event Action<string, bool, string, string> VariableSet; // edit result: va, ok, re-read value, error
@@ -420,6 +425,18 @@ namespace ClarionDebugger.Services
             if (!IsValidModuleName(module)) return false;
             if (string.IsNullOrEmpty(addrHex) || !Regex.IsMatch(addrHex, "^0x[0-9A-Fa-f]+$")) return false;
             return SendCommand("expand " + reqId + " " + module + " " + typeRef + " " + addrHex);
+        }
+
+        /// <summary>Fetch a window of a live QUEUE's stored rows. <paramref name="ctrlHex"/> is the control
+        /// block the engine located while it had the frame pointer (carried on the queue node as queueCtrl);
+        /// <paramref name="typeRef"/> is the record layout. Result arrives via QueueRowsReceived keyed by
+        /// <paramref name="reqId"/>. Args are validated to block injection over the space-split stdin protocol.</summary>
+        public bool RequestQueueRows(int reqId, string module, uint typeRef, string ctrlHex, int from)
+        {
+            if (!IsValidModuleName(module)) return false;
+            if (string.IsNullOrEmpty(ctrlHex) || !Regex.IsMatch(ctrlHex, "^0x[0-9A-Fa-f]+$")) return false;
+            if (from < 0) from = 0;
+            return SendCommand("queuerows " + reqId + " " + module + " " + typeRef + " " + ctrlHex + " " + from);
         }
 
         /// <summary>Request the locals of ONE call-stack frame (Call-Stack-driven Variables): the engine reads
@@ -713,6 +730,11 @@ namespace ClarionDebugger.Services
 
                 case "framelocals":
                     FrameLocalsReceived?.Invoke(GetStr(json, "reqId"), ExtractArrayBalanced(json, "items"));
+                    break;
+
+                case "queuerows":
+                    QueueRowsReceived?.Invoke(GetStr(json, "reqId"), ExtractArrayBalanced(json, "items"),
+                                              GetInt(json, "total"), GetStr(json, "error"));
                     break;
 
                 case "watch":

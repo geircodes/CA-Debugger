@@ -421,14 +421,15 @@ namespace ClarionDbg.Cli
                 Console.WriteLine($"  {pname}  (entry 0x{kv.Key:X}) — {kv.Value.Count} local(s):");
                 foreach (var l in kv.Value.OrderByDescending(x => x.FrameOff))
                 {
-                    // direct GROUP/QUEUE, or a by-ref one reached through a single reference hop
-                    var g = l.Type == null ? null
-                          : l.Type.Kind == TypeKind.Group ? l.Type
-                          : (l.Type.Kind == TypeKind.Reference && l.Type.Referent != null && l.Type.Referent.Kind == TypeKind.Group ? l.Type.Referent : null);
+                    // direct GROUP/QUEUE, or a by-ref one reached through ANY number of reference hops
+                    // (a `&QUEUE` local is reference->reference->group; see ClarionType.ResolveGroup)
+                    int hops = 0;
+                    var g = l.Type == null ? null : l.Type.ResolveGroup(out hops);
                     Console.WriteLine($"      [ebp{(l.FrameOff >= 0 ? "+" : "")}{l.FrameOff}]  {l.Name,-24} "
                         + $"code=0x{l.TypeCode:X2}{(l.Target != 0 ? $" ->0x{l.Target:X2}" : "")} size={l.Size}"
                         + (l.Places != 0 ? $" places={l.Places}" : "")
-                        + (g != null ? $"  {(l.TypeCode == 0x16 ? "&" : "")}GROUP(size={g.Size}) typeRef=0x{l.TypeRef:X}" : ""));
+                        + (g != null ? $"  {(l.TypeCode == 0x16 ? "&" : "")}GROUP(size={g.Size}) typeRef=0x{l.TypeRef:X}"
+                                       + (hops > 1 ? $" hops={hops}" : "") : ""));
                     if (g != null)
                         DumpTypeMembers(g, 10);
                 }

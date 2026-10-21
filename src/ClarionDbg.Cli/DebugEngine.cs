@@ -164,17 +164,22 @@ namespace ClarionDbg.Cli
         // While paused, hijack the CURRENT thread to call ClaRUN!THR$GetInstance(EAX=templateVA,
         // EBX=.cwtls base) and trap the return at an unmapped magic address. The paused thread IS
         // the thread whose instance the user wants — per-thread data resolves correctly by design.
+        //
+        // MECHANISM state — deliberately SINGULAR. There is one trap VA, one hijacked thread, and one
+        // scalar saved re-arm, so exactly one eval may be in flight at a time; BeginThreadedEval enforces
+        // that. Do not add a parallel set of these for a second consumer — see the comment there.
         private const uint EVAL_TRAP_VA = 0x7FFF1000;   // never valid in 32-bit user space
         private bool _evalActive;
         private uint _evalTid;
         private Native.CONTEXT_X86 _evalSavedCtx;
         private bool _evalHadRearm;
         private Rearm _evalSavedRearm;
-        private string _evalName;                       // pending watch: symbol + size to read
-        private uint _evalSize;
-        private string _evalTypeName;
-        private byte _evalTypeCode;
-        private uint _evalTemplateVa;
+        // CONTINUATION — what to do with the resolved per-thread instance address. A delegate rather than a
+        // "which kind of eval is this" discriminator, so each consumer captures its own payload in a closure
+        // and OnEvalComplete stays free of consumer-specific fields (watch needs a name/size/typeCode;
+        // queuerows needs a reqId/module/typeRef; a third would need something else again).
+        private Action<uint> _evalDone;
+        private string _evalWhat;                       // short label for error text, e.g. "watch GLOBALQUEUE"
 
         // source-level stepping state
         private StepMode _mode = StepMode.None;
@@ -302,6 +307,9 @@ namespace ClarionDbg.Cli
 
                     case Native.EXIT_THREAD_DEBUG_EVENT:
                         _threads.Remove(tid);
+                        // A thread carrying a hijacked func-eval will never reach the trap, so nothing would
+                        // ever clear _evalActive — leaving every later eval refused by the in-flight guard.
+                        AbortEval(tid, "the thread exited before THR$GetInstance returned");
                         break;
 
                     case Native.EXCEPTION_DEBUG_EVENT:
@@ -341,6 +349,13 @@ namespace ClarionDbg.Cli
                         }
                         else
                         {
+                            // A fault on the hijacked thread at any address OTHER than the magic trap means
+                            // THR$GetInstance itself failed (a bad template VA or .cwtls base). The eval will
+                            // never complete, so unwind the hijack before handing the exception on — otherwise
+                            // _evalActive stays true forever and the app's own SEH sees a fault on a stack we
+                            // rewrote.
+                            if (_evalActive && tid == _evalTid)
+                                AbortEval(tid, $"THR$GetInstance faulted (code 0x{exCode:X8} at 0x{exAddr:X})");
                             // pass first-chance non-breakpoint exceptions back to the app
                             status = Native.DBG_EXCEPTION_NOT_HANDLED;
                         }
@@ -554,7 +569,11 @@ namespace ClarionDbg.Cli
                         break;
 
                     case "moduledata": case "moddata":
-                        HandleModuleDataCommand(parts, ref ctx, haveCtx);
+                        // THREADed symbols need THR$GetInstance to resolve their per-thread instance, so —
+                        // like `watch` — this may have to leave the pause loop; the chain finishes across
+                        // one or more eval completions and then emits a single moduledata event.
+                        if (HandleModuleDataCommand(parts, tid, ref ctx, haveCtx))
+                            return;
                         break;
 
                     case "expand":   // lazy expansion of a reference node (read-only; no target code runs)
@@ -563,6 +582,18 @@ namespace ClarionDbg.Cli
 
                     case "framelocals":   // locals of one call-stack frame (Call-Stack-driven Variables)
                         HandleFrameLocalsCommand(parts);
+                        break;
+
+                    case "queuerows":   // stored rows of a live QUEUE (read-only; no target code runs)
+                        HandleQueueRowsCommand(parts);
+                        break;
+
+                    case "queuerowsname":
+                        // rows of a GLOBAL queue by name. A THREADed one needs the THR$GetInstance func-eval
+                        // first, so — like `watch` — this may have to leave the pause loop; the completion
+                        // handler finishes the walk and re-enters.
+                        if (HandleQueueRowsByNameCommand(parts, tid, hThread, ref ctx, haveCtx))
+                            return;
                         break;
 
                     case "disasm": case "u":
@@ -646,6 +677,14 @@ namespace ClarionDbg.Cli
                     case "disasm": case "u":
                     case "setval":
                         EmitError("target is running — " + verb + " is only valid while paused");
+                        break;
+
+                    // reqId-correlated requests: the host resolves a pending callback by reqId and has NO
+                    // timeout, so these must answer even when rejected — a bare EmitError would leave the
+                    // requesting row spinning forever.
+                    case "queuerows": case "queuerowsname":
+                        EmitQueueRowsError(parts.Length > 1 ? parts[1] : "0",
+                            "target is running — " + verb + " is only valid while paused");
                         break;
                     default:
                         EmitError("unknown command: " + verb);
